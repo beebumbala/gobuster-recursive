@@ -132,6 +132,7 @@ func (d *GobusterDir) PreRun(ctx context.Context, pr *libgobuster.Progress) erro
 		}
 	}
 
+	// testing random uuid to guarantee not existing page
 	guid := uuid.New()
 	url := *d.options.URL
 	url.Path = fmt.Sprintf("%s%s", url.Path, guid)
@@ -432,6 +433,12 @@ func (d *GobusterDir) GetConfigString() (string, error) {
 
 	if o.FollowRedirect {
 		if _, err := fmt.Fprintf(tw, "[+] Follow Redirect:\ttrue\n"); err != nil {
+			return "", err
+		}
+	}
+
+	if o.Recursive {
+		if _, err := fmt.Fprintf(tw, "[+] Recursive:\ttrue\n"); err != nil {
 			return "", err
 		}
 	}
