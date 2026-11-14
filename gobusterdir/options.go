@@ -23,6 +23,7 @@ type OptionsDir struct {
 	ExcludeLengthParsed        libgobuster.Set[int]
 	Force                      bool
 	Recursive                  bool
+	RecursionDepth             int
 }
 
 // NewOptions returns a new initialized OptionsDir

@@ -129,7 +129,43 @@ gobuster dir -u https://example.com -w wordlist.txt -l
 
 # Filter by status codes
 gobuster dir -u https://example.com -w wordlist.txt -s 200,301,302
+
+# Search discovered directories, breadth-first, up to two levels below the URL
+gobuster dir -u https://example.com -w wordlist.txt --recursive --recursion-depth 2
 ```
+
+Recursive directory scans share one worker pool, output file and cumulative progress
+display. Each directory gets a complete wordlist pass before moving to the next
+directory; deeper levels start after the current level finishes. `--recursion-depth`
+defaults to `0` (unlimited). Discovered directories are checked once, remain within
+the starting URL's origin and path, and receive their own wildcard check. A child
+directory that fails this check is skipped with a message.
+
+Directory detection uses redirects to the same path with a trailing slash,
+matching paths already ending in a slash, and probes of matching extensionless
+paths. A matching file such as `admin.php` does not trigger a directory probe
+unless it has a slash or a slash redirect. Dotted directories without these
+signals can be missed; HTTP routes can still resemble directories. Status and
+length filters apply to discovery.
+
+A same-host slash redirect that advertises a different HTTP scheme is treated as
+a directory hint: the candidate is checked on the original origin. The advertised
+URL is not followed. Different non-default ports, hosts and paths are not treated
+as slash redirects. In recursive mode, redirects outside the scan scope are not
+followed, including with `--follow-redirect`.
+
+With `-w -`, recursive scans cache stdin in a temporary file for subsequent passes
+and remove it when the scan ends. `--wordlist-offset` applies only to the initial
+directory; it does not restore a previous recursive scan. The progress total grows
+as more directories and additional guesses are scheduled.
+
+Directory scans finish with a tree of matching paths. Each level lists directories
+first, then other results with status `200`, then remaining results; names are
+sorted within each group. Entries show the original response status and size,
+and duplicate paths appear only once. Intermediate parents without an observed
+response use `?` for unknown metadata. The tree makes no additional requests.
+`--quiet` suppresses the tree; `--no-status`, `--hide-length` and `--no-color` also
+apply to it. The `--output` file retains the existing flat result format.
 
 #### 🔍 DNS Mode (`dns`)
 

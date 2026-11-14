@@ -42,6 +42,19 @@ type RequestOptions struct {
 	ModifiedHeaders          []HTTPHeader
 	UpdatedBasicAuthUsername string
 	UpdatedBasicAuthPassword string
+	// CheckURL limits both the initial request and redirects when supplied.
+	CheckURL  func(url.URL) bool
+	redirects *[]url.URL
+}
+
+// HTTPResponse retains URL information needed by directory discovery.
+type HTTPResponse struct {
+	StatusCode int
+	Length     int64
+	Header     http.Header
+	Body       []byte
+	URL        url.URL
+	Redirects  []url.URL
 }
 
 // NewHTTPClient returns a new HTTPClient
@@ -131,13 +144,21 @@ func NewHTTPClient(opt *HTTPOptions, logger *Logger) (*HTTPClient, error) {
 // Request makes a http request and returns the status, the content length, the headers, the body and an error
 // if you want the body returned set the corresponding property inside RequestOptions
 func (client *HTTPClient) Request(ctx context.Context, fullURL url.URL, opts RequestOptions) (int, int64, http.Header, []byte, error) {
+	response, err := client.RequestDetailed(ctx, fullURL, opts)
+	return response.StatusCode, response.Length, response.Header, response.Body, err
+}
+
+// RequestDetailed makes the same request as Request and retains redirect metadata.
+func (client *HTTPClient) RequestDetailed(ctx context.Context, fullURL url.URL, opts RequestOptions) (HTTPResponse, error) {
+	var response HTTPResponse
+	opts.redirects = &response.Redirects
 	resp, err := client.makeRequest(ctx, fullURL, opts)
 	if err != nil {
 		// ignore context canceled errors
 		if errors.Is(ctx.Err(), context.Canceled) {
-			return 0, 0, nil, nil, nil
+			return response, nil
 		}
-		return 0, 0, nil, nil, err
+		return response, err
 	}
 	defer resp.Body.Close()
 
@@ -146,7 +167,7 @@ func (client *HTTPClient) Request(ctx context.Context, fullURL url.URL, opts Req
 	if opts.ReturnBody {
 		body, err = io.ReadAll(resp.Body)
 		if err != nil {
-			return 0, 0, nil, nil, fmt.Errorf("could not read body %w", err)
+			return response, fmt.Errorf("could not read body %w", err)
 		}
 		length = int64(len(body))
 	} else {
@@ -154,14 +175,20 @@ func (client *HTTPClient) Request(ctx context.Context, fullURL url.URL, opts Req
 		// absolutely needed so golang will reuse connections!
 		length, err = io.Copy(io.Discard, resp.Body)
 		if err != nil {
-			return 0, 0, nil, nil, err
+			return response, err
 		}
 	}
 
-	return resp.StatusCode, length, resp.Header, body, nil
+	response.StatusCode, response.Length = resp.StatusCode, length
+	response.Header, response.Body = resp.Header, body
+	response.URL = *resp.Request.URL
+	return response, nil
 }
 
 func (client *HTTPClient) makeRequest(ctx context.Context, fullURL url.URL, opts RequestOptions) (*http.Response, error) {
+	if opts.CheckURL != nil && !opts.CheckURL(fullURL) {
+		return nil, fmt.Errorf("URL outside scan scope: %s", fullURL.String())
+	}
 	req, err := http.NewRequestWithContext(ctx, client.method, fullURL.String(), opts.Body)
 	if err != nil {
 		return nil, err
@@ -226,7 +253,26 @@ func (client *HTTPClient) makeRequest(ctx context.Context, fullURL url.URL, opts
 		client.logger.Debugf("%s", dump)
 	}
 
-	resp, err := client.client.Do(req)
+	// The client copy shares its transport and connection pool. Its redirect
+	// callback is request-local, so parallel requests never share mutable state.
+	requestClient := *client.client
+	requestClient.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		if opts.CheckURL != nil && !opts.CheckURL(*next.URL) {
+			return http.ErrUseLastResponse
+		}
+		if client.client.CheckRedirect != nil {
+			if err := client.client.CheckRedirect(next, via); err != nil {
+				return err
+			}
+		} else if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		if opts.redirects != nil {
+			*opts.redirects = append(*opts.redirects, *next.URL)
+		}
+		return nil
+	}
+	resp, err := requestClient.Do(req)
 	if err != nil {
 		var ue *url.Error
 		if errors.As(err, &ue) {

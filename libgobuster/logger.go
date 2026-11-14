@@ -1,6 +1,7 @@
 package libgobuster
 
 import (
+	"io"
 	"log" // nolint:depguard
 	"os"
 
@@ -14,6 +15,16 @@ type Logger struct {
 	warnLog  *log.Logger
 	infoLog  *log.Logger
 	debug    bool
+}
+
+// SetOutput routes all log levels through the supplied writers. Configure it
+// before starting workers, so direct HTTP debug logs share the CLI output lock.
+func (l *Logger) SetOutput(stdout, stderr io.Writer) {
+	l.log.SetOutput(stdout)
+	l.errorLog.SetOutput(stderr)
+	l.debugLog.SetOutput(stderr)
+	l.warnLog.SetOutput(stderr)
+	l.infoLog.SetOutput(stderr)
 }
 
 func NewLogger(debug bool) *Logger {

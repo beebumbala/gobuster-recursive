@@ -37,6 +37,7 @@ func getFlags() []cli.Flag {
 		&cli.StringFlag{Name: "exclude-length", Aliases: []string{"xl"}, Usage: "exclude the following content lengths (completely ignores the status). You can separate multiple lengths by comma and it also supports ranges like 203-206"},
 		&cli.BoolFlag{Name: "force", Value: false, Usage: "Continue even if the prechecks fail. Please only use this if you know what you are doing, it can lead to unexpected results."},
 		&cli.BoolFlag{Name: "recursive", Aliases: []string{"R"}, Value: false, Usage: "Goes recursively through all subdirectories (may take long time)."},
+		&cli.IntFlag{Name: "recursion-depth", Value: 0, Usage: "Maximum recursion depth below the starting URL (0 means unlimited; requires --recursive)"},
 	}...)
 	return flags
 }
@@ -96,6 +97,13 @@ func run(c *cli.Context) error {
 	pluginOpts.DiscoverBackup = c.Bool("discover-backup")
 	pluginOpts.Force = c.Bool("force")
 	pluginOpts.Recursive = c.Bool("recursive")
+	pluginOpts.RecursionDepth = c.Int("recursion-depth")
+	if pluginOpts.RecursionDepth < 0 {
+		return errors.New("recursion-depth must not be negative")
+	}
+	if c.IsSet("recursion-depth") && !pluginOpts.Recursive {
+		return errors.New("recursion-depth requires --recursive")
+	}
 	pluginOpts.ExcludeLength = c.String("exclude-length")
 	ret4, err := libgobuster.ParseCommaSeparatedInt(pluginOpts.ExcludeLength)
 	if err != nil {

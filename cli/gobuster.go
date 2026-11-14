@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/OJ/gobuster/v3/libgobuster"
+	"golang.org/x/term"
 )
 
 const (
@@ -20,7 +22,7 @@ const (
 
 // resultWorker outputs the results as they come in. This needs to be a range and should not handle
 // the context so the channel always has a receiver and libgobuster will not block.
-func resultWorker(g *libgobuster.Gobuster, filename string, wg *sync.WaitGroup) {
+func resultWorker(g *libgobuster.Gobuster, filename string, output io.Writer, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	var f *os.File
@@ -40,12 +42,7 @@ func resultWorker(g *libgobuster.Gobuster, filename string, wg *sync.WaitGroup) 
 		}
 		if s != "" {
 			s = strings.TrimSpace(s)
-			if g.Opts.NoProgress || g.Opts.Quiet {
-				_, _ = fmt.Printf("%s\n", s) // nolint forbidigo
-			} else {
-				// only print the clear line when progress output is enabled
-				_, _ = fmt.Printf("%s%s\n", TerminalClearLine, s) // nolint forbidigo
-			}
+			_, _ = fmt.Fprintln(output, s)
 			if f != nil {
 				err = writeToFile(f, s)
 				if err != nil {
@@ -92,7 +89,7 @@ func messageWorker(g *libgobuster.Gobuster, wg *sync.WaitGroup) {
 	}
 }
 
-func printProgress(g *libgobuster.Gobuster) {
+func printProgress(g *libgobuster.Gobuster, output *terminalOutput, final bool) {
 	requestsIssued := g.Progress.RequestsIssued()
 	requestsExpected := g.Progress.RequestsExpected()
 	if requestsExpected == 0 {
@@ -102,25 +99,28 @@ func printProgress(g *libgobuster.Gobuster) {
 	if math.IsNaN(float64(percent)) {
 		percent = 0.0
 	}
-	s := fmt.Sprintf("%sProgress: %d / %d (%3.2f%%)", TerminalClearLine, requestsIssued, requestsExpected, percent)
-	_, _ = fmt.Fprint(os.Stderr, s)
+	s := fmt.Sprintf("Progress: %d / %d (%3.2f%%)", requestsIssued, requestsExpected, percent)
+	if target, depth := g.Progress.Target(); target != "" {
+		s += fmt.Sprintf(" | Depth: %d | %s", depth, target)
+	}
+	output.progress(s, final)
 }
 
 // progressWorker outputs the progress every tick. It will stop once cancel() is called
 // on the context
-func progressWorker(ctx context.Context, g *libgobuster.Gobuster, wg *sync.WaitGroup) {
+func progressWorker(ctx context.Context, g *libgobuster.Gobuster, output *terminalOutput, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	tick := time.NewTicker(cliProgressUpdate)
+	defer tick.Stop()
 
 	for {
 		select {
 		case <-tick.C:
-			printProgress(g)
+			printProgress(g, output, false)
 		case <-ctx.Done():
 			// print the final progress so we end at 100%
-			printProgress(g)
-			fmt.Println() // nolint:forbidigo
+			printProgress(g, output, true)
 			return
 		}
 	}
@@ -171,22 +171,31 @@ func Gobuster(ctx context.Context, opts *libgobuster.Options, plugin libgobuster
 		log.Println(ruler)
 	}
 
-	fi, err := os.Stdout.Stat()
-	if err != nil {
-		return err
-	}
-	// check if we are not in a terminal. If so, disable output
-	if (fi.Mode() & os.ModeCharDevice) != os.ModeCharDevice {
+	// Both streams share the progress line only when attached to a terminal.
+	if !term.IsTerminal(int(os.Stdout.Fd())) || !term.IsTerminal(int(os.Stderr.Fd())) {
 		opts.NoProgress = true
 	}
+	output := &terminalOutput{
+		stdout: os.Stdout,
+		stderr: os.Stderr,
+		width: func() int {
+			width, _, err := term.GetSize(int(os.Stderr.Fd()))
+			if err != nil {
+				return 80
+			}
+			return width
+		},
+	}
+	log.SetOutput(output.stdoutWriter(), output.stderrWriter())
+	defer log.SetOutput(os.Stdout, os.Stderr)
 
 	// our waitgroup for all goroutines
 	// this ensures all goroutines are finished
 	// when we call wg.Wait()
-	var wg sync.WaitGroup
+	var wg, progressGroup sync.WaitGroup
 
 	wg.Add(1)
-	go resultWorker(gobuster, opts.OutputFilename, &wg)
+	go resultWorker(gobuster, opts.OutputFilename, output.stdoutWriter(), &wg)
 
 	wg.Add(1)
 	go errorWorker(gobuster, &wg)
@@ -196,17 +205,16 @@ func Gobuster(ctx context.Context, opts *libgobuster.Options, plugin libgobuster
 
 	if !opts.Quiet && !opts.NoProgress {
 		// if not quiet add a new workgroup entry and start the goroutine
-		wg.Add(1)
-		go progressWorker(ctxCancel, gobuster, &wg)
+		progressGroup.Add(1)
+		go progressWorker(ctxCancel, gobuster, output, &progressGroup)
 	}
 
 	err = gobuster.Run(ctxCancel)
 
-	// call cancel func so progressWorker will exit (the only goroutine in this
-	// file using the context) and to free resources
-	cancel()
-	// wait for all spun up goroutines to finish (all have to call wg.Done())
+	// Drain results and messages before printing the final progress line.
 	wg.Wait()
+	cancel()
+	progressGroup.Wait()
 
 	// Late error checking to finish all threads
 	if err != nil {
@@ -214,6 +222,11 @@ func Gobuster(ctx context.Context, opts *libgobuster.Options, plugin libgobuster
 	}
 
 	if !opts.Quiet {
+		if summary, ok := plugin.(libgobuster.SummaryPlugin); ok {
+			if err := summary.WriteSummary(output.stdoutWriter()); err != nil {
+				return fmt.Errorf("write scan summary: %w", err)
+			}
+		}
 		log.Println(ruler)
 		gobuster.Logger.Println("Finished")
 		log.Println(ruler)

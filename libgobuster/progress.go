@@ -24,6 +24,22 @@ type Progress struct {
 	ResultChan            chan Result
 	ErrorChan             chan error
 	MessageChan           chan Message
+	targetMutex           sync.RWMutex
+	target                string
+	depth                 int
+}
+
+// SetTarget updates the recursive pass shown alongside the cumulative counters.
+func (p *Progress) SetTarget(target string, depth int) {
+	p.targetMutex.Lock()
+	defer p.targetMutex.Unlock()
+	p.target, p.depth = target, depth
+}
+
+func (p *Progress) Target() (string, int) {
+	p.targetMutex.RLock()
+	defer p.targetMutex.RUnlock()
+	return p.target, p.depth
 }
 
 func NewProgress() *Progress {

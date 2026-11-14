@@ -5,8 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -37,12 +35,6 @@ type Guess struct {
 	discoverOnSuccess bool
 }
 
-type Wordlist struct {
-	scanner        *bufio.Scanner
-	guessesPerLine int
-	isStream       bool
-}
-
 // NewGobuster returns a new Gobuster object
 func NewGobuster(opts *Options, plugin GobusterPlugin, logger *Logger) (*Gobuster, error) {
 	var g Gobuster
@@ -54,273 +46,196 @@ func NewGobuster(opts *Options, plugin GobusterPlugin, logger *Logger) (*Gobuste
 	return &g, nil
 }
 
-func (g *Gobuster) worker(ctx context.Context, guessChan <-chan *Guess, successChan chan<- *Guess, wg *sync.WaitGroup) {
+type completedGuess struct {
+	guess *Guess
+	found bool
+}
+
+func (g *Gobuster) worker(ctx context.Context, guesses <-chan *Guess, completed chan<- completedGuess, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
-		// Prioritize stopping when the context is done
 		select {
 		case <-ctx.Done():
 			return
-		default:
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case guess := <-guessChan:
-
-			// Mode-specific processing
+		case guess := <-guesses:
+			if ctx.Err() != nil {
+				return
+			}
 			res, err := g.plugin.ProcessWord(ctx, guess.word, g.Progress)
 			if err != nil {
-				// do not exit and continue
 				g.Progress.ErrorChan <- fmt.Errorf("error on word %s: %w", guess.word, err)
 			}
-
 			if res != nil {
 				g.Progress.ResultChan <- res
-
-				select {
-				case <-ctx.Done():
-					g.Progress.incrementRequests()
-					return
-				case successChan <- guess:
-				}
 			}
-
 			g.Progress.incrementRequests()
-
-			select {
-			case <-ctx.Done():
-			case <-time.After(g.Opts.Delay):
-			}
-		}
-	}
-}
-
-func feed(ctx context.Context, guessChan chan<- *Guess, words []string, discoverOnSuccess bool) {
-	for _, w := range words {
-		guess := &Guess{word: w, discoverOnSuccess: discoverOnSuccess}
-		// Prioritize stopping when the context is done
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		select {
-		// need to check here too otherwise guessChan will block
-		case <-ctx.Done():
-			return
-		case guessChan <- guess:
-		}
-	}
-}
-
-func (g *Gobuster) feeder(ctx context.Context, guessChan chan<- *Guess, words []string, discoverOnSuccess bool, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	feed(ctx, guessChan, words, discoverOnSuccess)
-}
-
-func (g *Gobuster) feedWordlist(ctx context.Context, guessChan chan<- *Guess, wordlist *Wordlist, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	for wordlist.scanner.Scan() {
-		// Prioritize stopping when the context is done
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		word := strings.TrimSpace(wordlist.scanner.Text())
-
-		switch {
-		case wordlist.isStream && len(word) != 0:
-			// Increment to keep track of expected work
-			g.Progress.IncrementTotalRequests(wordlist.guessesPerLine)
-		case wordlist.isStream && len(word) == 0:
-			// Skip empty lines without incrementing
-			continue
-		case len(word) == 0:
-			// Skip empty lines removing expected work
-			g.Progress.IncrementTotalRequests(-1 * wordlist.guessesPerLine)
-			continue
-		}
-
-		if len(g.Opts.Patterns) > 0 {
-			for _, w := range g.processPatterns(word) {
-				guess := &Guess{word: w, discoverOnSuccess: true}
+			if g.Opts.Delay > 0 {
 				select {
 				case <-ctx.Done():
 					return
-				case guessChan <- guess:
+				case <-time.After(g.Opts.Delay):
 				}
-
-				feed(ctx, guessChan, g.plugin.AdditionalWords(w), true)
 			}
-		} else {
-			guess := &Guess{word: word, discoverOnSuccess: true}
-
 			select {
 			case <-ctx.Done():
 				return
-			case guessChan <- guess:
+			case completed <- completedGuess{guess: guess, found: res != nil}:
 			}
-
-			feed(ctx, guessChan, g.plugin.AdditionalWords(word), true)
 		}
 	}
 }
 
-func (g *Gobuster) getWordlist(wordlist io.ReadSeeker) (*Wordlist, error) {
-	// calculate expected requests
-	var guessesPerLine int
+// runPass owns admission and completion accounting. Progress counters are only
+// for display: EOF plus no queued or active work is the completion barrier.
+func (g *Gobuster) runPass(ctx context.Context, scanner *bufio.Scanner, expected int, guesses chan<- *Guess, completed <-chan completedGuess) error {
+	passCtx, cancel := context.WithCancel(ctx)
+	words := make(chan string)
+	readDone := make(chan error, 1)
+	var readers sync.WaitGroup
+	readers.Add(1)
+	go func() {
+		defer readers.Done()
+		defer func() {
+			readDone <- scanner.Err()
+			close(words)
+		}()
+		for scanner.Scan() {
+			word := strings.TrimSpace(scanner.Text())
+			if word == "" {
+				continue
+			}
+			select {
+			case <-passCtx.Done():
+				return
+			case words <- word:
+			}
+		}
+	}()
+	defer func() {
+		cancel()
+		readers.Wait()
+	}()
+
+	factor := 1 + g.plugin.AdditionalWordsLen()
 	if len(g.Opts.Patterns) > 0 {
-		nPats := len(g.Opts.Patterns)
-		guessesPerLine = nPats + nPats*g.plugin.AdditionalWordsLen()
-	} else {
-		guessesPerLine = 1 + g.plugin.AdditionalWordsLen()
+		factor *= len(g.Opts.Patterns)
 	}
-
-	if g.Opts.Wordlist == "-" {
-		// Read directly from stdin
-		return &Wordlist{scanner: bufio.NewScanner(os.Stdin), guessesPerLine: guessesPerLine, isStream: true}, nil
+	if expected >= 0 {
+		g.Progress.IncrementTotalRequests(expected * factor)
 	}
-
-	lines, err := lineCounter(wordlist)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get number of lines: %w", err)
-	}
-
-	if lines-g.Opts.WordlistOffset <= 0 {
-		return nil, errors.New("offset is greater than the number of lines in the wordlist")
-	}
-
-	g.Progress.IncrementTotalRequests(lines * guessesPerLine)
-
-	// add offset if needed (offset defaults to 0)
-	g.Progress.incrementRequestsIssues(g.Opts.WordlistOffset * guessesPerLine)
-
-	// rewind wordlist after lineCounter
-	_, err = wordlist.Seek(0, 0)
-	if err != nil {
-		return nil, fmt.Errorf("failed to rewind wordlist: %w", err)
-	}
-
-	wordlistScanner := bufio.NewScanner(wordlist)
-
-	// skip lines
-	for range g.Opts.WordlistOffset {
-		if !wordlistScanner.Scan() {
-			if err := wordlistScanner.Err(); err != nil {
-				return nil, fmt.Errorf("failed to skip lines in wordlist: %w", err)
+	var pending []*Guess
+	active := 0
+	for words != nil || len(pending) > 0 || active > 0 {
+		var input <-chan string
+		var output chan<- *Guess
+		var next *Guess
+		if len(pending) == 0 {
+			input = words
+		} else {
+			output, next = guesses, pending[0]
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case word, ok := <-input:
+			if !ok {
+				words = nil
+				if err := <-readDone; err != nil {
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					return fmt.Errorf("read wordlist: %w", err)
+				}
+				continue
 			}
-			return nil, errors.New("failed to skip lines in wordlist")
+			variants := []string{word}
+			if len(g.Opts.Patterns) > 0 {
+				variants = g.processPatterns(word)
+			}
+			for _, variant := range variants {
+				pending = append(pending, &Guess{word: variant, discoverOnSuccess: true})
+				for _, additional := range g.plugin.AdditionalWords(variant) {
+					pending = append(pending, &Guess{word: additional, discoverOnSuccess: true})
+				}
+			}
+			if expected < 0 {
+				g.Progress.IncrementTotalRequests(len(pending))
+			}
+		case output <- next:
+			pending[0] = nil
+			pending = pending[1:]
+			active++
+		case done := <-completed:
+			if done.found && done.guess.discoverOnSuccess {
+				extra := g.plugin.AdditionalSuccessWords(done.guess.word)
+				extra = append(extra, g.processDiscoverPatterns(done.guess.word)...)
+				g.Progress.IncrementTotalRequests(len(extra))
+				for _, word := range extra {
+					pending = append(pending, &Guess{word: word})
+				}
+			}
+			active--
 		}
 	}
-
-	return &Wordlist{scanner: wordlistScanner, guessesPerLine: guessesPerLine, isStream: false}, nil
+	return ctx.Err()
 }
 
-// Run the busting of the website with the given
-// set of settings from the command line.
+// Run keeps one worker pool and one set of result channels for every pass.
 func (g *Gobuster) Run(ctx context.Context) error {
 	defer close(g.Progress.ResultChan)
 	defer close(g.Progress.ErrorChan)
 	defer close(g.Progress.MessageChan)
-
+	if g.Opts.Threads < 1 {
+		return errors.New("threads must be greater than zero")
+	}
 	if err := g.plugin.PreRun(ctx, g.Progress); err != nil {
 		return err
 	}
-
-	workerCtx, workerCancel := context.WithCancel(ctx)
-	defer workerCancel()
-	feederCtx, feederCancel := context.WithCancel(ctx)
-	defer feederCancel()
-
-	var workerGroup, feederGroup sync.WaitGroup
-	workerGroup.Add(g.Opts.Threads)
-
-	guessChan := make(chan *Guess, g.Opts.Threads*3)
-	successChan := make(chan *Guess)
-
-	var f io.ReadSeekCloser
-	if g.Opts.Wordlist != "-" { // stdin case is handled inside getWordlist
-		var err error
-		f, err = os.Open(g.Opts.Wordlist)
-		if err != nil {
-			return fmt.Errorf("failed to open wordlist: %w", err)
-		}
-		defer f.Close()
+	replay := false
+	if plugin, ok := g.plugin.(ReplayPlugin); ok {
+		replay = plugin.NeedsWordlistReplay()
 	}
-
-	wordlist, err := g.getWordlist(f)
+	wordlist, err := openWordlist(g.Opts.Wordlist, g.Opts.WordlistOffset, replay)
 	if err != nil {
 		return err
 	}
+	defer wordlist.close()
+	// Closing a pipe on cancellation unblocks Scanner.Read. Capture the input
+	// now: the source switches to its replay file after the first pass.
+	if input := wordlist.stdin; input != nil {
+		stop := context.AfterFunc(ctx, func() { _ = input.Close() })
+		defer stop()
+	}
 
-	// Create goroutines for each of the number of threads
-	// specified.
+	workerCtx, cancel := context.WithCancel(ctx)
+	var workers sync.WaitGroup
+	guesses := make(chan *Guess)
+	completed := make(chan completedGuess)
 	for range g.Opts.Threads {
-		go g.worker(workerCtx, guessChan, successChan, &workerGroup)
+		workers.Add(1)
+		go g.worker(workerCtx, guesses, completed, &workers)
 	}
-
-	feederGroup.Add(1)
-	go g.feedWordlist(feederCtx, guessChan, wordlist, &feederGroup)
-
-ListenForMore:
+	defer func() {
+		cancel()
+		workers.Wait()
+	}()
 	for {
-		// Prioritize stopping when the context is done
-		select {
-		case <-ctx.Done():
-			break ListenForMore
-		default:
+		scanner, expected, err := wordlist.next()
+		if err != nil {
+			return err
 		}
-
-		select {
-		case <-ctx.Done():
-			break ListenForMore
-		case successGuess := <-successChan:
-			// Add more guesses based on the results of previous attempts
-			if successGuess.discoverOnSuccess {
-				discoverWords := g.plugin.AdditionalSuccessWords(successGuess.word)
-				if len(discoverWords) > 0 {
-					g.Progress.IncrementTotalRequests(len(discoverWords))
-					feederGroup.Add(1)
-					go g.feeder(feederCtx, guessChan, discoverWords, false, &feederGroup)
-				}
-
-				patternDiscoverWords := g.processDiscoverPatterns(successGuess.word)
-				if len(patternDiscoverWords) > 0 {
-					g.Progress.IncrementTotalRequests(len(patternDiscoverWords))
-					feederGroup.Add(1)
-					go g.feeder(feederCtx, guessChan, patternDiscoverWords, false, &feederGroup)
-				}
-			}
-		case <-time.After(200 * time.Millisecond):
-			// With requests issued only after the results are synchronously
-			// reported, this is well ordered without the timeout, however it would
-			// exert a lot of lock pressure during the run to keep doing this in a
-			// hot loop
-			if g.Progress.RequestsExpected() == g.Progress.RequestsIssued() {
-				// All the expected requests have completed, there is no pending or
-				// in-progress work. If moreWordsChan was buffered we would need to
-				// check it again here to ensure no pending work was added while we
-				// acquired the locks
-				break ListenForMore
-			}
+		if err := g.runPass(ctx, scanner, expected, guesses, completed); err != nil {
+			return err
+		}
+		plugin, ok := g.plugin.(MultiPassPlugin)
+		if !ok {
+			return nil
+		}
+		more, err := plugin.NextPass(ctx, g.Progress)
+		if err != nil || !more {
+			return err
 		}
 	}
-
-	feederCancel()
-	workerCancel()
-	feederGroup.Wait()
-	workerGroup.Wait()
-
-	if err := wordlist.scanner.Err(); err != nil {
-		return err
-	}
-
-	return nil
 }
 
 // GetConfigString returns the current config as a printable string

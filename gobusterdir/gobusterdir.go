@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"unicode/utf8"
@@ -45,9 +47,18 @@ func (e *WildcardError) Error() string {
 
 // GobusterDir is the main type to implement the interface
 type GobusterDir struct {
-	options    *OptionsDir
-	globalopts *libgobuster.Options
-	http       *libgobuster.HTTPClient
+	options      *OptionsDir
+	globalopts   *libgobuster.Options
+	http         *libgobuster.HTTPClient
+	rootURL      url.URL
+	currentURL   url.URL
+	currentLevel []url.URL
+	nextLevel    []url.URL
+	seen         map[string]bool
+	discoveryMu  sync.Mutex
+	depth        int
+	treeMu       sync.Mutex
+	tree         *foundNode
 }
 
 // New creates a new initialized GobusterDir
@@ -104,12 +115,26 @@ func (d *GobusterDir) Name() string {
 
 // PreRun is the pre run implementation of gobusterdir
 func (d *GobusterDir) PreRun(ctx context.Context, pr *libgobuster.Progress) error {
-	// add trailing slash
-	if !strings.HasSuffix(d.options.URL.Path, "/") {
-		d.options.URL.Path = fmt.Sprintf("%s/", d.options.URL.Path)
+	if d.options.RecursionDepth < 0 {
+		return errors.New("recursion depth must not be negative")
 	}
+	d.rootURL = *d.options.URL
+	if !strings.HasSuffix(d.rootURL.Path, "/") {
+		d.rootURL.Path += "/"
+		d.rootURL.RawPath = ""
+	}
+	d.currentURL = d.rootURL
+	d.seen = map[string]bool{d.rootURL.String(): true}
+	d.currentLevel, d.nextLevel, d.depth = nil, nil, 0
+	d.tree = &foundNode{}
+	if d.options.Recursive {
+		pr.SetTarget(d.rootURL.String(), 0)
+	}
+	return d.preRunDirectory(ctx, pr)
+}
 
-	_, _, _, _, err := d.http.Request(ctx, *d.options.URL, libgobuster.RequestOptions{})
+func (d *GobusterDir) preRunDirectory(ctx context.Context, pr *libgobuster.Progress) error {
+	_, _, _, _, err := d.http.Request(ctx, d.currentURL, d.requestOptions())
 	if err != nil {
 		var retErr error
 		switch {
@@ -120,7 +145,7 @@ func (d *GobusterDir) PreRun(ctx context.Context, pr *libgobuster.Progress) erro
 		case errors.Is(err, syscall.ECONNREFUSED):
 			retErr = libgobuster.ErrConnectionRefused
 		default:
-			retErr = fmt.Errorf("unable to connect to %s: %w", d.options.URL, err)
+			retErr = fmt.Errorf("unable to connect to %s: %w", d.currentURL.String(), err)
 		}
 		if !d.options.Force {
 			return retErr
@@ -132,15 +157,20 @@ func (d *GobusterDir) PreRun(ctx context.Context, pr *libgobuster.Progress) erro
 		}
 	}
 
-	// testing random uuid to guarantee not existing page
+	return d.checkWildcard(ctx, pr)
+}
+
+func (d *GobusterDir) checkWildcard(ctx context.Context, pr *libgobuster.Progress) error {
+	// Test a random child separately for every directory.
 	guid := uuid.New()
-	url := *d.options.URL
+	url := d.currentURL
 	url.Path = fmt.Sprintf("%s%s", url.Path, guid)
+	url.RawPath = ""
 	if d.options.UseSlash {
 		url.Path = fmt.Sprintf("%s/", url.Path)
 	}
 
-	wildcardResp, wildcardLength, wildcardHeader, _, err := d.http.Request(ctx, url, libgobuster.RequestOptions{})
+	wildcardResp, wildcardLength, wildcardHeader, _, err := d.http.Request(ctx, url, d.requestOptions())
 	if err != nil {
 		var retErr error
 		switch {
@@ -226,6 +256,9 @@ func (d *GobusterDir) ProcessWord(ctx context.Context, word string, progress *li
 		suffix = "/"
 	}
 	entity := fmt.Sprintf("%s%s", word, suffix)
+	if d.options.Recursive && d.options.UseSlash && strings.HasSuffix(word, "/") {
+		entity = word
+	}
 
 	// prevent double slashes by removing leading /
 	if strings.HasPrefix(entity, "/") {
@@ -233,8 +266,12 @@ func (d *GobusterDir) ProcessWord(ctx context.Context, word string, progress *li
 		_, i := utf8.DecodeRuneInString(entity)
 		entity = entity[i:]
 	}
-	url := *d.options.URL
+	url := d.currentURL
 	url.Path = fmt.Sprintf("%s%s", url.Path, entity)
+	url.RawPath = ""
+	if d.options.Recursive && !d.inScope(url) {
+		return nil, nil // nolint:nilnil
+	}
 
 	// add some debug output
 	if d.globalopts.Debug {
@@ -253,9 +290,11 @@ func (d *GobusterDir) ProcessWord(ctx context.Context, word string, progress *li
 	var statusCode int
 	var size int64
 	var header http.Header
+	var response libgobuster.HTTPResponse
 	for i := 1; i <= tries; i++ {
 		var err error
-		statusCode, size, header, _, err = d.http.Request(ctx, url, libgobuster.RequestOptions{})
+		response, err = d.http.RequestDetailed(ctx, url, d.requestOptions())
+		statusCode, size, header = response.StatusCode, response.Length, response.Header
 		if err != nil {
 			// check if it's a timeout and if we should try again and try again
 			// otherwise the timeout error is raised
@@ -298,6 +337,12 @@ func (d *GobusterDir) ProcessWord(ctx context.Context, word string, progress *li
 		}
 
 		if resultStatus && !d.options.ExcludeLengthParsed.Contains(int(size)) {
+			candidate, directory := d.directoryCandidate(url, response)
+			d.recordFinding(url, response, directory)
+			if d.options.Recursive {
+				d.discoverDirectory(candidate)
+				entity = strings.TrimPrefix(url.Path, d.rootURL.Path)
+			}
 			path := fmt.Sprintf("%-20s", entity)
 			if d.options.Expanded {
 				// expanded mode should show the full url
@@ -439,6 +484,9 @@ func (d *GobusterDir) GetConfigString() (string, error) {
 
 	if o.Recursive {
 		if _, err := fmt.Fprintf(tw, "[+] Recursive:\ttrue\n"); err != nil {
+			return "", err
+		}
+		if _, err := fmt.Fprintf(tw, "[+] Recursion depth:\t%d (0 = unlimited)\n", o.RecursionDepth); err != nil {
 			return "", err
 		}
 	}
